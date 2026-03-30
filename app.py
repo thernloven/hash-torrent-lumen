@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import threading
 import time
@@ -83,8 +84,11 @@ def add_torrent():
         'r2_key': data.get('r2_key'),
         'content_id': data.get('content_id'),
         'callback_url': data.get('callback_url'),
+        'season_pack': data.get('season_pack', False),
         'status': 'downloading',
         'upload_progress': 0,
+        'upload_total_files': 0,
+        'upload_current_file': 0,
     }
 
     global last_activity
@@ -119,13 +123,16 @@ def list_torrents():
             'progress': round(s.progress * 100, 1),
             'dlspeed': s.download_rate,
             'upspeed': s.upload_rate,
-            'state': t['status'] if t['status'] == 'uploading' else state_map.get(s.state, str(s.state)),
+            'state': t['status'] if t['status'] in ('uploading', 'uploading_season') else state_map.get(s.state, str(s.state)),
             'seeds': s.num_seeds,
             'peers': s.num_peers,
             'eta': eta,
             'content_id': t.get('content_id'),
             'upload_progress': t.get('upload_progress', 0),
             'paused': s.paused,
+            'season_pack': t.get('season_pack', False),
+            'upload_total_files': t.get('upload_total_files', 0),
+            'upload_current_file': t.get('upload_current_file', 0),
         })
     return jsonify(result), 200
 
@@ -164,6 +171,54 @@ def delete_torrent(info_hash):
 # Background: monitor downloads, upload to R2, idle shutdown
 # -------------------------------------------------------------------
 
+VIDEO_EXTENSIONS = {'.mkv', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.mpg', '.mpeg', '.ts'}
+MIN_VIDEO_SIZE = 50 * 1024 * 1024  # 50MB — excludes samples
+
+
+def parse_episode_info(filename, default_season=None):
+    '''Extract season and episode number from a filename.'''
+    # S01E01, s01e01, S1E1
+    m = re.search(r'[Ss](\d{1,2})\s*[Ee](\d{1,2})', filename)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    # 1x01, 1X01
+    m = re.search(r'(\d{1,2})[xX](\d{1,2})', filename)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    # Bare E01 with a default season
+    if default_season:
+        m = re.search(r'[Ee](\d{1,2})', filename)
+        if m:
+            return default_season, int(m.group(1))
+    return None, None
+
+
+def find_video_files(directory, default_season=None):
+    '''Find all video files in a directory, with parsed season/episode info.'''
+    results = []
+    for root, _, files in os.walk(directory):
+        for f in files:
+            path = os.path.join(root, f)
+            ext = os.path.splitext(f)[1].lower()
+            if ext not in VIDEO_EXTENSIONS:
+                continue
+            size = os.path.getsize(path)
+            if size < MIN_VIDEO_SIZE:
+                continue
+            season, episode = parse_episode_info(f, default_season)
+            results.append({
+                'path': path,
+                'filename': f,
+                'size': size,
+                'season': season,
+                'episode': episode,
+                'extension': ext.lstrip('.'),
+            })
+    # Sort by season, then episode
+    results.sort(key=lambda x: (x['season'] or 0, x['episode'] or 0))
+    return results
+
+
 def find_largest_file(directory):
     '''Find the largest file in the torrent download (the actual media file).'''
     largest = None
@@ -185,8 +240,9 @@ def upload_to_r2(file_path, r2_key, info_hash):
         return False
 
     file_size = os.path.getsize(file_path)
-    t['status'] = 'uploading'
-    t['upload_progress'] = 0
+    if not t.get('season_pack'):
+        t['status'] = 'uploading'
+        t['upload_progress'] = 0
 
     headers = {'X-API-Key': API_KEY, 'Content-Type': 'application/json'}
 
@@ -260,6 +316,129 @@ def notify_callback(callback_url, info_hash, content_id, status):
         pass
 
 
+def _handle_single_file(info_hash, t, save_path, torrent_info):
+    '''Handle a completed single-file torrent download.'''
+    global last_activity
+
+    if torrent_info and torrent_info.num_files() == 1:
+        file_path = os.path.join(save_path, torrent_info.files().file_path(0))
+    else:
+        file_path = find_largest_file(save_path)
+
+    if not file_path or not os.path.exists(file_path):
+        log.error(f'[MONITOR] File not found after download: {info_hash}')
+        t['status'] = 'error'
+        return
+
+    r2_key = t.get('r2_key')
+    notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'uploading')
+
+    file_size = os.path.getsize(file_path)
+    log.info(f'[MONITOR] Uploading to R2: {file_path} ({file_size} bytes)')
+    success = upload_to_r2(file_path, r2_key, info_hash)
+    log.info(f'[MONITOR] R2 upload {"success" if success else "FAILED"}: {info_hash}')
+    notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'uploaded' if success else 'failed')
+
+    if success:
+        ses.remove_torrent(t['handle'], lt.options_t.delete_files)
+        del active_torrents[info_hash]
+        last_activity = time.time()
+        log.info(f'[MONITOR] Cleaned up {info_hash}')
+
+
+def _handle_season_pack(info_hash, t, save_path, torrent_info, torrent_name):
+    '''Handle a completed season pack torrent: discover episodes, register, upload each.'''
+    global last_activity
+
+    # Try to extract a default season number from the torrent name
+    default_season = None
+    if torrent_name:
+        m = re.search(r'[Ss](\d{1,2})(?!\s*[Ee]\d)', torrent_name) or re.search(r'\bseason\s*(\d{1,2})\b', torrent_name, re.IGNORECASE)
+        if m:
+            default_season = int(m.group(1))
+
+    video_files = find_video_files(save_path, default_season)
+    episode_files = [f for f in video_files if f['season'] is not None and f['episode'] is not None]
+
+    if not episode_files:
+        log.error(f'[SEASON] No episode files found in season pack: {info_hash}')
+        t['status'] = 'error'
+        notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'failed')
+        return
+
+    # Deduplicate: keep largest file per (season, episode) pair
+    seen = {}
+    for ef in episode_files:
+        key = (ef['season'], ef['episode'])
+        if key not in seen or ef['size'] > seen[key]['size']:
+            seen[key] = ef
+    episode_files = sorted(seen.values(), key=lambda x: (x['season'], x['episode']))
+
+    log.info(f'[SEASON] Found {len(episode_files)} unique episodes in pack')
+
+    # Call backend to register files and get R2 keys
+    headers = {'X-API-Key': API_KEY, 'Content-Type': 'application/json'}
+    try:
+        resp = requests.post(f'{BACKEND_URL}/api/torrents/season-files', json={
+            'content_id': t.get('content_id'),
+            'info_hash': info_hash,
+            'files': [{
+                'filename': f['filename'],
+                'size': f['size'],
+                'season': f['season'],
+                'episode': f['episode'],
+                'extension': f['extension'],
+            } for f in episode_files],
+        }, headers=headers, timeout=30)
+    except Exception as e:
+        log.error(f'[SEASON] Failed to call season-files endpoint: {e}')
+        t['status'] = 'error'
+        notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'failed')
+        return
+
+    if resp.status_code != 200:
+        log.error(f'[SEASON] Backend rejected season files: {resp.text}')
+        t['status'] = 'error'
+        notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'failed')
+        return
+
+    file_keys = resp.json().get('file_keys', {})
+
+    t['status'] = 'uploading_season'
+    t['upload_total_files'] = len(episode_files)
+    t['upload_current_file'] = 0
+    notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'uploading')
+
+    success_count = 0
+    for i, ef in enumerate(episode_files):
+        r2_key = file_keys.get(ef['filename'])
+        if not r2_key:
+            log.warning(f'[SEASON] No R2 key for {ef["filename"]}, skipping')
+            continue
+
+        t['upload_current_file'] = i + 1
+        t['upload_progress'] = round((i / len(episode_files)) * 100, 1)
+
+        log.info(f'[SEASON] Uploading {i+1}/{len(episode_files)}: {ef["filename"]} -> {r2_key}')
+        if upload_to_r2(ef['path'], r2_key, info_hash):
+            success_count += 1
+            last_activity = time.time()  # Reset idle timer after each file
+        else:
+            log.error(f'[SEASON] Failed to upload {ef["filename"]}')
+
+    t['upload_progress'] = 100
+
+    if success_count > 0:
+        notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'uploaded')
+        ses.remove_torrent(t['handle'], lt.options_t.delete_files)
+        del active_torrents[info_hash]
+        last_activity = time.time()
+        log.info(f'[SEASON] Season pack complete: {success_count}/{len(episode_files)} files uploaded')
+    else:
+        t['status'] = 'error'
+        notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'failed')
+
+
 def monitor_loop():
     '''Background thread: watch for completed downloads, upload to R2, idle shutdown.'''
     global last_activity
@@ -279,37 +458,15 @@ def monitor_loop():
                 log.info(f'[MONITOR] Download complete: {s.name} ({info_hash})')
                 handle.pause()  # stop seeding
 
-                # Find the downloaded file
                 save_path = handle.save_path()
                 torrent_info = handle.torrent_file()
-                if torrent_info and torrent_info.num_files() == 1:
-                    file_path = os.path.join(save_path, torrent_info.files().file_path(0))
-                else:
-                    file_path = find_largest_file(save_path)
 
-                if not file_path or not os.path.exists(file_path):
-                    log.error(f'[MONITOR] File not found after download: {info_hash}')
-                    t['status'] = 'error'
-                    continue
-
-                r2_key = t.get('r2_key')
-                if r2_key:
-                    # Notify backend: status → uploading
-                    notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'uploading')
-
-                    # Upload to R2 via multipart
-                    file_size = os.path.getsize(file_path)
-                    log.info(f'[MONITOR] Uploading to R2: {file_path} ({file_size} bytes)')
-                    success = upload_to_r2(file_path, r2_key, info_hash)
-                    log.info(f'[MONITOR] R2 upload {"success" if success else "FAILED"}: {info_hash}')
-                    notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'uploaded' if success else 'failed')
-
-                    if success:
-                        # Clean up: remove torrent + files
-                        ses.remove_torrent(handle, lt.options_t.delete_files)
-                        del active_torrents[info_hash]
-                        last_activity = time.time()
-                        log.info(f'[MONITOR] Cleaned up {info_hash}')
+                if t.get('season_pack'):
+                    # Season pack: discover episode files, register with backend, upload each
+                    _handle_season_pack(info_hash, t, save_path, torrent_info, s.name)
+                elif t.get('r2_key'):
+                    # Single file: existing behavior
+                    _handle_single_file(info_hash, t, save_path, torrent_info)
                 else:
                     # No R2 URL — just mark as done (local download mode)
                     t['status'] = 'completed'

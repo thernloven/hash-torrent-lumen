@@ -15,7 +15,7 @@ mkdir -p /var/www/html
 cd /var/www/html
 
 echo "=== Creating virtual environment ==="
-python3 -m venv venv
+python3 -m venv --system-site-packages venv
 source venv/bin/activate
 pip install flask flask_cors requests gunicorn
 
