@@ -59,6 +59,23 @@ def require_auth(f):
 def health():
     return jsonify({'status': 'ok', 'active_torrents': len(active_torrents)}), 200
 
+
+@app.route('/status', methods=['GET'])
+@require_auth
+def status():
+    '''Report worker capacity: active torrents and free disk space.'''
+    import shutil
+    disk = shutil.disk_usage(DOWNLOAD_PATH)
+    downloading = sum(1 for t in active_torrents.values() if t['status'] == 'downloading')
+    uploading = sum(1 for t in active_torrents.values() if t['status'] in ('uploading', 'uploading_season'))
+    return jsonify({
+        'active_torrents': len(active_torrents),
+        'downloading': downloading,
+        'uploading': uploading,
+        'disk_total_gb': round(disk.total / (1024 ** 3), 1),
+        'disk_free_gb': round(disk.free / (1024 ** 3), 1),
+    }), 200
+
 # -------------------------------------------------------------------
 # Torrent management
 # -------------------------------------------------------------------
