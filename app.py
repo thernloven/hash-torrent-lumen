@@ -350,6 +350,13 @@ def _handle_season_pack(info_hash, t, save_path, torrent_info, torrent_name):
     '''Handle a completed season pack torrent: discover episodes, register, upload each.'''
     global last_activity
 
+    # Scope to the torrent's own subdirectory (not the shared /tmp/torrents)
+    if torrent_info and torrent_info.num_files() > 1:
+        first_file = torrent_info.files().file_path(0)
+        if '/' in first_file:
+            torrent_dir = first_file.split('/')[0]
+            save_path = os.path.join(save_path, torrent_dir)
+
     # Try to extract a default season number from the torrent name
     default_season = None
     if torrent_name:
