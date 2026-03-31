@@ -154,6 +154,26 @@ def list_torrents():
     return jsonify(result), 200
 
 
+@app.route('/torrents/update/<info_hash>', methods=['POST'])
+@require_auth
+def update_torrent(info_hash):
+    '''Update metadata on an existing torrent without restarting it.'''
+    t = active_torrents.get(info_hash)
+    if not t:
+        return jsonify({'error': 'Not found'}), 404
+    data = request.json or {}
+    if 'r2_key' in data:
+        t['r2_key'] = data['r2_key']
+    if 'content_id' in data:
+        t['content_id'] = data['content_id']
+    if 'callback_url' in data:
+        t['callback_url'] = data['callback_url']
+    if 'season_pack' in data:
+        t['season_pack'] = data['season_pack']
+    log.info(f'[UPDATE] Updated torrent {info_hash}: content_id={t.get("content_id")}, has_r2_key={bool(t.get("r2_key"))}, season_pack={t.get("season_pack")}')
+    return jsonify({'status': 'ok'}), 200
+
+
 @app.route('/torrents/pause/<info_hash>', methods=['POST'])
 @require_auth
 def pause_torrent(info_hash):
@@ -486,11 +506,11 @@ def monitor_loop():
                 torrent_info = handle.torrent_file()
 
                 if t.get('season_pack'):
-                    # Season pack: discover episode files, register with backend, upload each
-                    _handle_season_pack(info_hash, t, save_path, torrent_info, s.name)
+                    t['status'] = 'uploading_season'
+                    threading.Thread(target=_handle_season_pack, args=(info_hash, t, save_path, torrent_info, s.name), daemon=True).start()
                 elif t.get('r2_key'):
-                    # Single file: existing behavior
-                    _handle_single_file(info_hash, t, save_path, torrent_info)
+                    t['status'] = 'uploading'
+                    threading.Thread(target=_handle_single_file, args=(info_hash, t, save_path, torrent_info), daemon=True).start()
                 else:
                     # No R2 URL — just mark as done (local download mode)
                     t['status'] = 'completed'
