@@ -32,7 +32,21 @@ os.makedirs(DOWNLOAD_PATH, exist_ok=True)
 ses = lt.session({
     'listen_interfaces': '0.0.0.0:6881,[::]:6881',
     'alert_mask': lt.alert.category_t.all_categories,
+    'enable_dht': True,
+    'enable_lsd': True,
+    'enable_pex': True,
 })
+
+# Bootstrap DHT with well-known nodes so metadata resolves on fresh workers
+DHT_BOOTSTRAP_NODES = [
+    ("router.bittorrent.com", 6881),
+    ("router.utorrent.com", 6881),
+    ("dht.transmissionbt.com", 6881),
+    ("dht.aelitis.com", 6881),
+]
+for host, port in DHT_BOOTSTRAP_NODES:
+    ses.add_dht_node((host, port))
+log.info(f"[DHT] Bootstrapped with {len(DHT_BOOTSTRAP_NODES)} nodes")
 
 # Track torrents: info_hash -> {handle, r2_key, content_id, status, upload_progress}
 active_torrents = {}
@@ -106,6 +120,7 @@ def add_torrent():
         'upload_progress': 0,
         'upload_total_files': 0,
         'upload_current_file': 0,
+        'added_at': time.time(),
     }
 
     global last_activity
@@ -170,7 +185,21 @@ def update_torrent(info_hash):
         t['callback_url'] = data['callback_url']
     if 'season_pack' in data:
         t['season_pack'] = data['season_pack']
-    log.info(f'[UPDATE] Updated torrent {info_hash}: content_id={t.get("content_id")}, has_r2_key={bool(t.get("r2_key"))}, season_pack={t.get("season_pack")}')
+    log.info(f'[UPDATE] Updated torrent {info_hash}: content_id={t.get("content_id")}, has_r2_key={bool(t.get("r2_key"))}, season_pack={t.get("season_pack")}, status={t["status"]}')
+
+    # If torrent already finished downloading, trigger upload now that we have r2_key
+    if t['status'] == 'completed' and t.get('r2_key'):
+        handle = t['handle']
+        save_path = handle.save_path()
+        torrent_info = handle.torrent_file()
+        if t.get('season_pack'):
+            t['status'] = 'uploading_season'
+            threading.Thread(target=_handle_season_pack, args=(info_hash, t, save_path, torrent_info, handle.status().name), daemon=True).start()
+        else:
+            t['status'] = 'uploading'
+            threading.Thread(target=_handle_single_file, args=(info_hash, t, save_path, torrent_info), daemon=True).start()
+        log.info(f'[UPDATE] Torrent already complete, starting upload: {info_hash}')
+
     return jsonify({'status': 'ok'}), 200
 
 
@@ -497,6 +526,20 @@ def monitor_loop():
             handle = t['handle']
             s = handle.status()
 
+            # Auto-retry if metadata is stuck (state 2 = downloading_metadata)
+            if s.state == 2 and not s.name:
+                elapsed = time.time() - t.get('added_at', time.time())
+                if elapsed > 60:
+                    log.info(f'[MONITOR] Metadata stuck for {int(elapsed)}s, re-adding: {info_hash}')
+                    magnet = lt.make_magnet_uri(handle)
+                    ses.remove_torrent(handle)
+                    params = lt.parse_magnet_uri(magnet)
+                    params.save_path = DOWNLOAD_PATH
+                    new_handle = ses.add_torrent(params)
+                    t['handle'] = new_handle
+                    t['added_at'] = time.time()
+                    continue
+
             # Check if download is complete
             if s.progress >= 1.0 and s.state in (4, 5):  # finished or seeding
                 log.info(f'[MONITOR] Download complete: {s.name} ({info_hash})')
@@ -518,7 +561,9 @@ def monitor_loop():
                     log.info(f'[MONITOR] Local download complete: {info_hash}')
 
         # Idle self-destruct — delete this droplet via DO API
-        if IDLE_SHUTDOWN_MINUTES > 0 and not active_torrents:
+        # Don't shut down if any torrents are uploading or downloading
+        has_active_work = any(t['status'] in ('downloading', 'uploading', 'uploading_season') for t in active_torrents.values())
+        if IDLE_SHUTDOWN_MINUTES > 0 and not active_torrents and not has_active_work:
             idle_seconds = time.time() - last_activity
             if idle_seconds > IDLE_SHUTDOWN_MINUTES * 60:
                 log.info('[MONITOR] Idle timeout reached, self-destructing droplet...')
