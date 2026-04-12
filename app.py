@@ -34,7 +34,6 @@ ses = lt.session({
     'alert_mask': lt.alert.category_t.all_categories,
     'enable_dht': True,
     'enable_lsd': True,
-    'enable_pex': True,
 })
 
 # Bootstrap DHT with well-known nodes so metadata resolves on fresh workers
