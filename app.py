@@ -29,8 +29,13 @@ IDLE_SHUTDOWN_MINUTES = int(os.getenv('IDLE_SHUTDOWN_MINUTES', '10'))
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
 
 # Libtorrent session
+# Bind to the NordVPN (NordLynx) tunnel interface, NOT 0.0.0.0. Binding to all interfaces
+# makes libtorrent source peer connections from eth0's real IP, which NordLynx's policy
+# routing then drops -> 0 peers, torrents stuck in "downloading_metadata". Binding to
+# `nordlynx` forces all peer traffic through the VPN (works + no real-IP leak).
 ses = lt.session({
-    'listen_interfaces': '0.0.0.0:6881,[::]:6881',
+    'listen_interfaces': 'nordlynx:6881',
+    'outgoing_interfaces': 'nordlynx',
     'alert_mask': lt.alert.category_t.all_categories,
     'enable_dht': True,
     'enable_lsd': True,

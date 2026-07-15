@@ -33,6 +33,8 @@ Type=simple
 User=root
 WorkingDirectory=/var/www/html
 EnvironmentFile=/var/www/html/.env
+# libtorrent binds to the nordlynx interface, so wait for the VPN tunnel before starting
+ExecStartPre=/bin/bash -c 'until ip link show nordlynx >/dev/null 2>&1; do sleep 2; done'
 ExecStart=/var/www/html/venv/bin/gunicorn --bind 0.0.0.0:8080 --workers 1 --threads 4 --timeout 120 app:app
 Restart=always
 RestartSec=5
