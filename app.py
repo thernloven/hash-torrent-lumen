@@ -39,6 +39,12 @@ ses = lt.session({
     'alert_mask': lt.alert.category_t.all_categories,
     'enable_dht': True,
     'enable_lsd': True,
+    # Per-user concurrency is enforced by the backend (via pause/resume). Keep the
+    # per-worker session cap high so it's never the bottleneck — libtorrent's default
+    # active_downloads is only 3, which stalled the 4th+ torrent on a worker.
+    'active_downloads': 20,
+    'active_seeds': 20,
+    'active_limit': 40,
 })
 
 # Bootstrap DHT with well-known nodes so metadata resolves on fresh workers
@@ -401,9 +407,19 @@ def _handle_single_file(info_hash, t, save_path, torrent_info):
         return
 
     r2_key = t.get('r2_key')
-    notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'uploading')
 
     file_size = os.path.getsize(file_path)
+    # Guard: never upload an empty/incomplete file. A torrent that falsely reports complete
+    # leaves a pre-allocated all-zero file; real media containers have non-zero header bytes.
+    with open(file_path, 'rb') as fh:
+        head = fh.read(65536)
+    if file_size == 0 or not any(b != 0 for b in head):
+        log.error(f'[MONITOR] Refusing to upload empty/zero-header file: {info_hash} ({file_size} bytes)')
+        t['status'] = 'error'
+        notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'failed')
+        return
+
+    notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'uploading')
     log.info(f'[MONITOR] Uploading to R2: {file_path} ({file_size} bytes)')
     success = upload_to_r2(file_path, r2_key, info_hash)
     log.info(f'[MONITOR] R2 upload {"success" if success else "FAILED"}: {info_hash}')
@@ -544,8 +560,11 @@ def monitor_loop():
                     t['added_at'] = time.time()
                     continue
 
-            # Check if download is complete
-            if s.progress >= 1.0 and s.state in (4, 5):  # finished or seeding
+            # Check if download is complete. Require real wanted data AND all of it done:
+            # s.progress reads 1.0 when total_wanted == 0 (libtorrent's "nothing wanted =
+            # 100%" convention), which previously uploaded empty pre-allocated files.
+            if (s.progress >= 1.0 and s.state in (4, 5)
+                    and s.total_wanted > 0 and s.total_done >= s.total_wanted):  # finished or seeding
                 log.info(f'[MONITOR] Download complete: {s.name} ({info_hash})')
                 handle.pause()  # stop seeding
 
