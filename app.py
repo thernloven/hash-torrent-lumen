@@ -532,12 +532,42 @@ def _handle_season_pack(info_hash, t, save_path, torrent_info, torrent_name):
         notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'failed')
 
 
+def _nordlynx_ifindex():
+    '''Interface index of the NordVPN tunnel. It changes when NordVPN reconnects and
+    recreates the interface — the signal we use to detect a reconnect (the IP stays the same).'''
+    try:
+        with open('/sys/class/net/nordlynx/ifindex') as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
 def monitor_loop():
     '''Background thread: watch for completed downloads, upload to R2, idle shutdown.'''
     global last_activity
 
+    last_ifindex = _nordlynx_ifindex()
+
     while True:
         time.sleep(2)
+
+        # VPN self-heal: libtorrent binds to the nordlynx tunnel at startup. When NordVPN
+        # reconnects (server switch / autoconnect re-establish), it RECREATES the interface
+        # and libtorrent's socket is left bound to the dead one -> 0 peers on everything.
+        # Detect the reconnect via the interface index and re-bind sockets on the fly.
+        cur_ifindex = _nordlynx_ifindex()
+        if cur_ifindex and cur_ifindex != last_ifindex:
+            log.info(f'[VPN] nordlynx recreated (ifindex {last_ifindex}->{cur_ifindex}) — re-binding libtorrent')
+            try:
+                ses.reopen_network_sockets()
+                for t in active_torrents.values():
+                    try:
+                        t['handle'].force_reannounce()
+                    except Exception:
+                        pass
+            except Exception as e:
+                log.error(f'[VPN] reopen_network_sockets failed: {e}')
+            last_ifindex = cur_ifindex
 
         for info_hash, t in list(active_torrents.items()):
             if t['status'] != 'downloading':
