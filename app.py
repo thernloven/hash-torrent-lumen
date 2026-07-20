@@ -559,7 +559,7 @@ def monitor_loop():
         if cur_ifindex and cur_ifindex != last_ifindex:
             log.info(f'[VPN] nordlynx recreated (ifindex {last_ifindex}->{cur_ifindex}) — re-binding libtorrent')
             try:
-                ses.reopen_network_sockets()
+                ses.reopen_network_sockets(0)  # re-bind listen/outgoing sockets to the new tunnel
                 for t in active_torrents.values():
                     try:
                         t['handle'].force_reannounce()
