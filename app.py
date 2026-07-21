@@ -378,16 +378,16 @@ def upload_to_r2(file_path, r2_key, info_hash):
         return False
 
 
-def notify_callback(callback_url, info_hash, content_id, status):
-    '''Notify the backend of status changes.'''
+def notify_callback(callback_url, info_hash, content_id, status, r2_key=None):
+    '''Notify the backend of status changes. r2_key lets the backend target the right
+    episode (its path carries s##e##) instead of erroring the whole series.'''
     if not callback_url:
         return
     try:
-        requests.post(callback_url, json={
-            'info_hash': info_hash,
-            'content_id': content_id,
-            'status': status,
-        }, headers={'X-API-Key': API_KEY}, timeout=10)
+        body = {'info_hash': info_hash, 'content_id': content_id, 'status': status}
+        if r2_key:
+            body['r2_key'] = r2_key
+        requests.post(callback_url, json=body, headers={'X-API-Key': API_KEY}, timeout=10)
     except Exception:
         pass
 
@@ -420,16 +420,30 @@ def _handle_single_file(info_hash, t, save_path, torrent_info):
         return
 
     notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'uploading')
-    log.info(f'[MONITOR] Uploading to R2: {file_path} ({file_size} bytes)')
-    success = upload_to_r2(file_path, r2_key, info_hash)
-    log.info(f'[MONITOR] R2 upload {"success" if success else "FAILED"}: {info_hash}')
-    notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'uploaded' if success else 'failed')
 
-    if success:
-        ses.remove_torrent(t['handle'], lt.options_t.delete_files)
-        del active_torrents[info_hash]
-        last_activity = time.time()
-        log.info(f'[MONITOR] Cleaned up {info_hash}')
+    # Retry R2 upload — a single transient failure used to orphan the torrent (left seeding
+    # forever, episode stuck 'downloading', worker never idle-shuts-down).
+    success = False
+    for attempt in range(1, 4):
+        log.info(f'[MONITOR] Uploading to R2 (attempt {attempt}/3): {file_path} ({file_size} bytes)')
+        success = upload_to_r2(file_path, r2_key, info_hash)
+        if success:
+            log.info(f'[MONITOR] R2 upload success: {info_hash}')
+            break
+        log.error(f'[MONITOR] R2 upload attempt {attempt}/3 FAILED: {info_hash}')
+        if attempt < 3:
+            time.sleep(10 * attempt)
+
+    if not success:
+        log.error(f'[MONITOR] R2 upload gave up after 3 attempts: {info_hash} — marking error')
+        t['status'] = 'error'
+    notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'uploaded' if success else 'failed', r2_key)
+
+    # Always remove the torrent + free the slot (success OR give-up) so the worker never hangs.
+    ses.remove_torrent(t['handle'], lt.options_t.delete_files)
+    del active_torrents[info_hash]
+    last_activity = time.time()
+    log.info(f'[MONITOR] Cleaned up {info_hash}')
 
 
 def _handle_season_pack(info_hash, t, save_path, torrent_info, torrent_name):
