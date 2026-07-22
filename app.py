@@ -3,6 +3,7 @@ import re
 import logging
 import threading
 import time
+import uuid
 
 import requests
 import libtorrent as lt
@@ -251,18 +252,41 @@ VIDEO_EXTENSIONS = {'.mkv', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m
 MIN_VIDEO_SIZE = 50 * 1024 * 1024  # 50MB — excludes samples
 
 
+# Multilingual "season" folder names — foreign-language releases commonly organize
+# episodes into per-season directories (e.g. "Temporada 2/") with no per-file season
+# token at all, relying entirely on the folder for that context.
+SEASON_DIR_RE = re.compile(r'\b(?:temporada|season|saison|stagione|staffel|sezon)\s*\.?\s*(\d{1,2})\b', re.IGNORECASE)
+
+
+def _season_from_path(rel_path):
+    '''Look for a season number in the directory components of a relative path.'''
+    for part in re.split(r'[\\/]', rel_path):
+        m = SEASON_DIR_RE.search(part)
+        if m:
+            return int(m.group(1))
+    return None
+
+
 def parse_episode_info(filename, default_season=None):
-    '''Extract season and episode number from a filename.'''
+    '''Extract season and episode number from a filename. Returns (season, episode),
+    either of which may be None if it couldn't be determined — callers must NOT guess
+    a missing value (e.g. from file order); an ambiguous file should be surfaced for
+    the user to confirm instead.'''
     # S01E01, s01e01, S1E1
     m = re.search(r'[Ss](\d{1,2})\s*[Ee](\d{1,2})', filename)
     if m:
         return int(m.group(1)), int(m.group(2))
-    # 1x01, 1X01
-    m = re.search(r'(\d{1,2})[xX](\d{1,2})', filename)
+    # 1x01, 1X01 (also "1 x 01")
+    m = re.search(r'(\d{1,2})\s*[xX]\s*(\d{1,2})', filename)
     if m:
         return int(m.group(1)), int(m.group(2))
-    # Bare E01 with a default season
-    if default_season:
+    if default_season is not None:
+        # Multilingual bare-episode markers — foreign releases rarely use S/E or NxN:
+        # Capítulo/Capitulo (ES), Episodio/Epis?dio (ES/IT/PT), Folge (DE), Épisode (FR)
+        m = re.search(r'(?:cap[íi]tulo|epis[oó]dio|episodio|folge|[ée]pisode)\s*\.?\s*n?\s*(\d{1,3})', filename, re.IGNORECASE)
+        if m:
+            return default_season, int(m.group(1))
+        # Bare E01 with a default season
         m = re.search(r'[Ee](\d{1,2})', filename)
         if m:
             return default_season, int(m.group(1))
@@ -270,7 +294,9 @@ def parse_episode_info(filename, default_season=None):
 
 
 def find_video_files(directory, default_season=None):
-    '''Find all video files in a directory, with parsed season/episode info.'''
+    '''Find all video files in a directory, with parsed season/episode info. Files that
+    can't be fully identified still come back (season and/or episode as None) rather
+    than being dropped — callers decide whether to surface them for user confirmation.'''
     results = []
     for root, _, files in os.walk(directory):
         for f in files:
@@ -281,18 +307,38 @@ def find_video_files(directory, default_season=None):
             size = os.path.getsize(path)
             if size < MIN_VIDEO_SIZE:
                 continue
-            season, episode = parse_episode_info(f, default_season)
+            rel = os.path.relpath(path, directory)
+            folder_season = _season_from_path(rel)
+            season, episode = parse_episode_info(f, folder_season or default_season)
             results.append({
                 'path': path,
                 'filename': f,
                 'size': size,
                 'season': season,
                 'episode': episode,
+                # Best-effort hint for the review UI even when full parsing failed
+                # (e.g. season known from folder, episode number still ambiguous).
+                'suggested_season': season or folder_season or default_season,
+                'suggested_episode': episode,
                 'extension': ext.lstrip('.'),
             })
-    # Sort by season, then episode
-    results.sort(key=lambda x: (x['season'] or 0, x['episode'] or 0))
+    # Sort by season, then episode (unresolved sort last within their group)
+    results.sort(key=lambda x: (x['season'] or 99, x['episode'] or 9999))
     return results
+
+
+def _safe_r2_filename(name):
+    '''Sanitize a filename for use in an R2 object key (keep it readable for debugging).'''
+    return re.sub(r'[^\w.\-() ]', '_', name)[:120]
+
+
+def _scoped_save_path(save_path, torrent_info):
+    '''If the torrent's files live under a common subdirectory, scope save_path to it.'''
+    if torrent_info and torrent_info.num_files() > 1:
+        first_file = torrent_info.files().file_path(0)
+        if '/' in first_file:
+            return os.path.join(save_path, first_file.split('/')[0])
+    return save_path
 
 
 def find_largest_file(directory):
@@ -447,15 +493,14 @@ def _handle_single_file(info_hash, t, save_path, torrent_info):
 
 
 def _handle_season_pack(info_hash, t, save_path, torrent_info, torrent_name):
-    '''Handle a completed season pack torrent: discover episodes, register, upload each.'''
+    '''Handle a completed season pack torrent: discover episodes, register, upload each.
+    Files we can confidently parse season+episode for go straight to their slot. Files
+    that are real videos but couldn't be identified (e.g. plain "1.mkv", "Capítulo.mkv"
+    with no season folder) are NOT dropped or positionally guessed — they upload to a
+    staging key and get reported to the backend for the user to confirm season/episode.'''
     global last_activity
 
-    # Scope to the torrent's own subdirectory (not the shared /tmp/torrents)
-    if torrent_info and torrent_info.num_files() > 1:
-        first_file = torrent_info.files().file_path(0)
-        if '/' in first_file:
-            torrent_dir = first_file.split('/')[0]
-            save_path = os.path.join(save_path, torrent_dir)
+    save_path = _scoped_save_path(save_path, torrent_info)
 
     # Try to extract a default season number from the torrent name
     default_season = None
@@ -463,78 +508,82 @@ def _handle_season_pack(info_hash, t, save_path, torrent_info, torrent_name):
         m = re.search(r'[Ss](\d{1,2})(?!\s*[Ee]\d)', torrent_name) or re.search(r'\bseason\s*(\d{1,2})\b', torrent_name, re.IGNORECASE)
         if m:
             default_season = int(m.group(1))
+    # Also honor a season embedded in the originally-assigned r2_key, for the
+    # content-based-detection path (torrent named without any season token at all).
+    if default_season is None and t.get('r2_key'):
+        m = re.search(r'/s(\d{2})e\d{2}/', t['r2_key'])
+        if m:
+            default_season = int(m.group(1))
 
     video_files = find_video_files(save_path, default_season)
-    episode_files = [f for f in video_files if f['season'] is not None and f['episode'] is not None]
 
-    if not episode_files:
-        log.error(f'[SEASON] No episode files found in season pack: {info_hash}')
+    if not video_files:
+        log.error(f'[SEASON] No video files found in season pack: {info_hash}')
         t['status'] = 'error'
         notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'failed')
         return
 
-    # Deduplicate: keep largest file per (season, episode) pair
+    resolved = [f for f in video_files if f['season'] is not None and f['episode'] is not None]
+    unresolved = [f for f in video_files if f['season'] is None or f['episode'] is None]
+
+    # Deduplicate resolved: keep largest file per (season, episode) pair
     seen = {}
-    for ef in episode_files:
+    for ef in resolved:
         key = (ef['season'], ef['episode'])
         if key not in seen or ef['size'] > seen[key]['size']:
             seen[key] = ef
-    episode_files = sorted(seen.values(), key=lambda x: (x['season'], x['episode']))
+    resolved = sorted(seen.values(), key=lambda x: (x['season'], x['episode']))
 
-    log.info(f'[SEASON] Found {len(episode_files)} unique episodes in pack')
+    log.info(f'[SEASON] Found {len(resolved)} identified + {len(unresolved)} unresolved video files in pack')
 
-    # Call backend to register files and get R2 keys
     headers = {'X-API-Key': API_KEY, 'Content-Type': 'application/json'}
-    try:
-        resp = requests.post(f'{BACKEND_URL}/api/torrents/season-files', json={
-            'content_id': t.get('content_id'),
-            'info_hash': info_hash,
-            'files': [{
-                'filename': f['filename'],
-                'size': f['size'],
-                'season': f['season'],
-                'episode': f['episode'],
-                'extension': f['extension'],
-            } for f in episode_files],
-        }, headers=headers, timeout=30)
-    except Exception as e:
-        log.error(f'[SEASON] Failed to call season-files endpoint: {e}')
-        t['status'] = 'error'
-        notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'failed')
-        return
+    file_keys = {}
+    if resolved:
+        try:
+            resp = requests.post(f'{BACKEND_URL}/api/torrents/season-files', json={
+                'content_id': t.get('content_id'),
+                'info_hash': info_hash,
+                'files': [{
+                    'filename': f['filename'],
+                    'size': f['size'],
+                    'season': f['season'],
+                    'episode': f['episode'],
+                    'extension': f['extension'],
+                } for f in resolved],
+            }, headers=headers, timeout=30)
+            if resp.status_code == 200:
+                file_keys = resp.json().get('file_keys', {})
+            else:
+                log.error(f'[SEASON] Backend rejected season files: {resp.text}')
+        except Exception as e:
+            log.error(f'[SEASON] Failed to call season-files endpoint: {e}')
 
-    if resp.status_code != 200:
-        log.error(f'[SEASON] Backend rejected season files: {resp.text}')
-        t['status'] = 'error'
-        notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'failed')
-        return
-
-    file_keys = resp.json().get('file_keys', {})
-
+    total_files = len(resolved) + len(unresolved)
     t['status'] = 'uploading_season'
-    t['upload_total_files'] = len(episode_files)
+    t['upload_total_files'] = total_files
     t['upload_current_file'] = 0
     notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'uploading')
 
     success_count = 0
-    failed = []  # episodes we couldn't upload even after retries
-    for i, ef in enumerate(episode_files):
+    failed = []  # (file, r2_key) episodes we couldn't upload even after retries
+    idx = 0
+    for ef in resolved:
+        idx += 1
         r2_key = file_keys.get(ef['filename'])
         if not r2_key:
             log.warning(f'[SEASON] No R2 key for {ef["filename"]}, skipping')
             failed.append((ef, None))
             continue
 
-        t['status'] = 'uploading_season'
-        t['upload_current_file'] = i + 1
-        t['upload_progress'] = round((i / len(episode_files)) * 100, 1)
+        t['upload_current_file'] = idx
+        t['upload_progress'] = round(((idx - 1) / total_files) * 100, 1)
 
         # Per-episode upload retry (mirrors _handle_single_file). Without this, a single
         # transient R2 hiccup left the episode stuck 'downloading' forever: the pack marked
         # itself done off the OTHER episodes and deleted the torrent, orphaning this one.
         uploaded = False
         for attempt in range(1, 4):
-            log.info(f'[SEASON] Uploading {i+1}/{len(episode_files)} (attempt {attempt}/3): {ef["filename"]} -> {r2_key}')
+            log.info(f'[SEASON] Uploading {idx}/{total_files} (attempt {attempt}/3): {ef["filename"]} -> {r2_key}')
             if upload_to_r2(ef['path'], r2_key, info_hash):
                 uploaded = True
                 break
@@ -551,19 +600,62 @@ def _handle_season_pack(info_hash, t, save_path, torrent_info, torrent_name):
             # specific episode → it shows "Try again" instead of hanging on 'downloading').
             notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'failed', r2_key=r2_key)
 
+    # Unresolved: upload to a staging key and report to the backend for the user to
+    # confirm season/episode — never guess from file order (e.g. "1, 2, 3, 4, 5").
+    pending_reported = 0
+    for ef in unresolved:
+        idx += 1
+        staging_key = f"content/{t.get('content_id')}/unresolved/{uuid.uuid4().hex[:8]}-{_safe_r2_filename(ef['filename'])}"
+        t['upload_current_file'] = idx
+        t['upload_progress'] = round(((idx - 1) / total_files) * 100, 1)
+
+        uploaded = False
+        for attempt in range(1, 4):
+            log.info(f'[SEASON] Uploading unresolved {idx}/{total_files} (attempt {attempt}/3): {ef["filename"]} -> {staging_key}')
+            if upload_to_r2(ef['path'], staging_key, info_hash):
+                uploaded = True
+                break
+            log.error(f'[SEASON] Upload failed for unresolved {ef["filename"]} (attempt {attempt}/3)')
+            time.sleep(10 * attempt)
+
+        if not uploaded:
+            log.error(f'[SEASON] Gave up uploading unresolved {ef["filename"]} after 3 attempts — lost with the torrent')
+            continue
+
+        last_activity = time.time()
+        try:
+            r = requests.post(f'{BACKEND_URL}/api/torrents/pending-files', json={
+                'content_id': t.get('content_id'),
+                'files': [{
+                    'staging_key': staging_key,
+                    'filename': ef['filename'],
+                    'size': ef['size'],
+                    'extension': ef['extension'],
+                    'suggested_season': ef.get('suggested_season'),
+                    'suggested_episode': ef.get('suggested_episode'),
+                }],
+            }, headers=headers, timeout=30)
+            if r.status_code == 200:
+                pending_reported += 1
+            else:
+                log.error(f'[SEASON] Backend rejected pending-file report for {ef["filename"]}: {r.text}')
+        except Exception as e:
+            log.error(f'[SEASON] Failed to report pending file {ef["filename"]}: {e}')
+
     t['upload_progress'] = 100
 
     if success_count > 0:
         notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'uploaded')
 
-    # Only tear down once every episode is resolved (uploaded or explicitly marked failed).
-    # Failed ones are now 'error' + retryable, so removing the torrent no longer orphans
-    # them — and removing it lets the worker idle-shut-down instead of seeding forever.
-    if failed:
-        log.warning(f'[SEASON] Season pack partial: {success_count}/{len(episode_files)} uploaded, '
-                    f'{len(failed)} failed (marked retryable): {[f[0]["filename"] for f in failed]}')
+    # Only tear down once every file is resolved (uploaded, staged for review, or
+    # explicitly marked failed). Failed ones are now 'error' + retryable, and staged ones
+    # are tracked server-side, so removing the torrent no longer orphans anything — and
+    # removing it lets the worker idle-shut-down instead of seeding forever.
+    if failed or unresolved:
+        log.warning(f'[SEASON] Season pack partial: {success_count}/{len(resolved)} identified episodes uploaded, '
+                    f'{len(failed)} failed (retryable), {pending_reported}/{len(unresolved)} staged for review')
     else:
-        log.info(f'[SEASON] Season pack complete: {success_count}/{len(episode_files)} files uploaded')
+        log.info(f'[SEASON] Season pack complete: {success_count}/{len(resolved)} files uploaded')
 
     ses.remove_torrent(t['handle'], lt.options_t.delete_files)
     del active_torrents[info_hash]
@@ -657,8 +749,29 @@ def monitor_loop():
                     t['status'] = 'uploading_season'
                     threading.Thread(target=_handle_season_pack, args=(info_hash, t, save_path, torrent_info, s.name), daemon=True).start()
                 elif t.get('r2_key'):
-                    t['status'] = 'uploading'
-                    threading.Thread(target=_handle_single_file, args=(info_hash, t, save_path, torrent_info), daemon=True).start()
+                    # Content-based season-pack detection: a torrent added as a single
+                    # episode (season_pack=false) can still BE a full pack if its name
+                    # lacked a season token — common for foreign-language releases (e.g.
+                    # "Los simuladores" with no "Season"/"S01" in the title). Detect from
+                    # what actually downloaded rather than trusting the name-derived flag:
+                    # if more than one real video file landed for an episode-context
+                    # torrent, treat it as a pack so every episode gets discovered instead
+                    # of only the single file the backend originally pointed at.
+                    r2_key = t.get('r2_key', '')
+                    ep_match = re.search(r'/s(\d{2})e(\d{2})/', r2_key)
+                    video_files = (
+                        find_video_files(_scoped_save_path(save_path, torrent_info), int(ep_match.group(1)))
+                        if ep_match else []
+                    )
+                    if ep_match and len(video_files) > 1:
+                        log.info(f'[MONITOR] {len(video_files)} video files found for an episode-flagged '
+                                 f'torrent — treating as season pack: {info_hash}')
+                        t['season_pack'] = True
+                        t['status'] = 'uploading_season'
+                        threading.Thread(target=_handle_season_pack, args=(info_hash, t, save_path, torrent_info, s.name), daemon=True).start()
+                    else:
+                        t['status'] = 'uploading'
+                        threading.Thread(target=_handle_single_file, args=(info_hash, t, save_path, torrent_info), daemon=True).start()
                 else:
                     # No R2 URL — just mark as done (local download mode)
                     t['status'] = 'completed'
