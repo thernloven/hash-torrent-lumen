@@ -445,7 +445,14 @@ def _handle_single_file(info_hash, t, save_path, torrent_info):
     if torrent_info and torrent_info.num_files() == 1:
         file_path = os.path.join(save_path, torrent_info.files().file_path(0))
     else:
-        file_path = find_largest_file(save_path)
+        # CRITICAL: every torrent shares the same root save_path (DOWNLOAD_PATH), so an
+        # unscoped find_largest_file() walks EVERY torrent currently on disk, not just this
+        # one — when several "single-file" torrents (which almost always actually bundle a
+        # sample/NFO/subs alongside the real video) complete around the same time, each one
+        # would grab whichever file is largest ACROSS ALL OF THEM, uploading the same file
+        # under multiple different titles. Scope to this torrent's own subdirectory first,
+        # matching _handle_season_pack.
+        file_path = find_largest_file(_scoped_save_path(save_path, torrent_info))
 
     if not file_path or not os.path.exists(file_path):
         log.error(f'[MONITOR] File not found after download: {info_hash}')
