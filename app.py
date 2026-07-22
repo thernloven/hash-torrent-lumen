@@ -517,33 +517,57 @@ def _handle_season_pack(info_hash, t, save_path, torrent_info, torrent_name):
     notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'uploading')
 
     success_count = 0
+    failed = []  # episodes we couldn't upload even after retries
     for i, ef in enumerate(episode_files):
         r2_key = file_keys.get(ef['filename'])
         if not r2_key:
             log.warning(f'[SEASON] No R2 key for {ef["filename"]}, skipping')
+            failed.append((ef, None))
             continue
 
+        t['status'] = 'uploading_season'
         t['upload_current_file'] = i + 1
         t['upload_progress'] = round((i / len(episode_files)) * 100, 1)
 
-        log.info(f'[SEASON] Uploading {i+1}/{len(episode_files)}: {ef["filename"]} -> {r2_key}')
-        if upload_to_r2(ef['path'], r2_key, info_hash):
+        # Per-episode upload retry (mirrors _handle_single_file). Without this, a single
+        # transient R2 hiccup left the episode stuck 'downloading' forever: the pack marked
+        # itself done off the OTHER episodes and deleted the torrent, orphaning this one.
+        uploaded = False
+        for attempt in range(1, 4):
+            log.info(f'[SEASON] Uploading {i+1}/{len(episode_files)} (attempt {attempt}/3): {ef["filename"]} -> {r2_key}')
+            if upload_to_r2(ef['path'], r2_key, info_hash):
+                uploaded = True
+                break
+            log.error(f'[SEASON] Upload failed for {ef["filename"]} (attempt {attempt}/3)')
+            time.sleep(10 * attempt)
+
+        if uploaded:
             success_count += 1
             last_activity = time.time()  # Reset idle timer after each file
         else:
-            log.error(f'[SEASON] Failed to upload {ef["filename"]}')
+            log.error(f'[SEASON] Gave up on {ef["filename"]} after 3 attempts')
+            failed.append((ef, r2_key))
+            # Mark THIS episode failed (r2_key carries /s##e##/ so the backend errors the
+            # specific episode → it shows "Try again" instead of hanging on 'downloading').
+            notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'failed', r2_key=r2_key)
 
     t['upload_progress'] = 100
 
     if success_count > 0:
         notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'uploaded')
-        ses.remove_torrent(t['handle'], lt.options_t.delete_files)
-        del active_torrents[info_hash]
-        last_activity = time.time()
-        log.info(f'[SEASON] Season pack complete: {success_count}/{len(episode_files)} files uploaded')
+
+    # Only tear down once every episode is resolved (uploaded or explicitly marked failed).
+    # Failed ones are now 'error' + retryable, so removing the torrent no longer orphans
+    # them — and removing it lets the worker idle-shut-down instead of seeding forever.
+    if failed:
+        log.warning(f'[SEASON] Season pack partial: {success_count}/{len(episode_files)} uploaded, '
+                    f'{len(failed)} failed (marked retryable): {[f[0]["filename"] for f in failed]}')
     else:
-        t['status'] = 'error'
-        notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'failed')
+        log.info(f'[SEASON] Season pack complete: {success_count}/{len(episode_files)} files uploaded')
+
+    ses.remove_torrent(t['handle'], lt.options_t.delete_files)
+    del active_torrents[info_hash]
+    last_activity = time.time()
 
 
 def _nordlynx_ifindex():
@@ -561,6 +585,7 @@ def monitor_loop():
     global last_activity
 
     last_ifindex = _nordlynx_ifindex()
+    last_socket_reopen = 0.0  # throttle for heal-on-stuck socket re-binds
 
     while True:
         time.sleep(2)
@@ -594,6 +619,19 @@ def monitor_loop():
             if s.state == 2 and not s.name:
                 elapsed = time.time() - t.get('added_at', time.time())
                 if elapsed > 60:
+                    # A torrent stuck fetching metadata with no peers is the signature of a
+                    # libtorrent socket stranded on a dead nordlynx interface after a NordVPN
+                    # reconnect that the ifindex-delta watchdog missed (startup race: the
+                    # baseline was captured AFTER the reconnect). Proactively re-bind sockets
+                    # (throttled, global) so it self-heals without a manual service restart.
+                    if time.time() - last_socket_reopen > 120:
+                        log.info('[VPN] metadata stuck with no peers — forcing socket re-bind (heal-on-stuck)')
+                        try:
+                            ses.reopen_network_sockets(0)
+                            last_socket_reopen = time.time()
+                            last_ifindex = _nordlynx_ifindex()  # resync baseline so the delta watchdog doesn't double-fire
+                        except Exception as e:
+                            log.error(f'[VPN] heal-on-stuck reopen failed: {e}')
                     log.info(f'[MONITOR] Metadata stuck for {int(elapsed)}s, re-adding: {info_hash}')
                     magnet = lt.make_magnet_uri(handle)
                     ses.remove_torrent(handle)
