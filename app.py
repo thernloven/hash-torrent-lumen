@@ -822,10 +822,24 @@ def monitor_loop():
                     # "El.Encargado.Temporada.1" before the classifier learned "Temporada")
                     # had nothing to trigger re-classification and silently uploaded just
                     # the single largest file as if it were a whole movie.
-                    r2_key = t.get('r2_key', '')
-                    ep_match = re.search(r'/s(\d{2})e(\d{2})/', r2_key)
-                    default_season_hint = int(ep_match.group(1)) if ep_match else None
-                    video_files = find_video_files(_scoped_save_path(save_path, torrent_info), default_season_hint)
+                    #
+                    # ONLY do this for torrents that are structurally multi-file
+                    # (torrent_info.num_files() > 1) — that's the only case where
+                    # _scoped_save_path can actually scope the scan to THIS torrent's own
+                    # subfolder. A genuinely single-file torrent has no such subfolder (it
+                    # downloads straight into the shared DOWNLOAD_PATH root), so scanning it
+                    # walks EVERY torrent currently on disk, not just this one. Live incident
+                    # (2026-07-23): "One Day" and "Marley and Me", two unrelated single-file
+                    # movies finishing around the same time, each saw the other's file sitting
+                    # in the shared root, concluded "more than one video file -> season pack",
+                    # and uploaded both under whichever one's check ran first — two standalone
+                    # movies merged into one fake "series" needing manual season/episode entry.
+                    video_files = []
+                    if torrent_info and torrent_info.num_files() > 1:
+                        r2_key = t.get('r2_key', '')
+                        ep_match = re.search(r'/s(\d{2})e(\d{2})/', r2_key)
+                        default_season_hint = int(ep_match.group(1)) if ep_match else None
+                        video_files = find_video_files(_scoped_save_path(save_path, torrent_info), default_season_hint)
                     if len(video_files) > 1:
                         log.info(f'[MONITOR] {len(video_files)} video files found for a torrent classified as '
                                  f'single-file — treating as season pack: {info_hash}')
