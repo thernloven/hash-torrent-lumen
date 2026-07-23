@@ -1,6 +1,7 @@
 import os
 import re
 import logging
+import subprocess
 import threading
 import time
 import uuid
@@ -29,14 +30,33 @@ IDLE_SHUTDOWN_MINUTES = int(os.getenv('IDLE_SHUTDOWN_MINUTES', '10'))
 
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
 
+
+def _nordlynx_ip():
+    '''NordVPN always hands the nordlynx tunnel the same IP (10.5.0.2) — including across
+    reconnects, where the interface itself is destroyed and recreated with a new ifindex.
+    Binding libtorrent to this IP instead of the interface NAME sidesteps needing to
+    re-resolve "nordlynx" -> ifindex after a reconnect at all.'''
+    for _ in range(30):
+        try:
+            out = subprocess.check_output(['ip', '-o', '-4', 'addr', 'show', 'nordlynx'], text=True)
+            m = re.search(r'inet (\d+\.\d+\.\d+\.\d+)', out)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+        time.sleep(1)
+    raise RuntimeError('nordlynx interface never got an IPv4 address')
+
+
+NORDLYNX_IP = _nordlynx_ip()
+
 # Libtorrent session
-# Bind to the NordVPN (NordLynx) tunnel interface, NOT 0.0.0.0. Binding to all interfaces
-# makes libtorrent source peer connections from eth0's real IP, which NordLynx's policy
-# routing then drops -> 0 peers, torrents stuck in "downloading_metadata". Binding to
-# `nordlynx` forces all peer traffic through the VPN (works + no real-IP leak).
+# Bind to the NordVPN (NordLynx) tunnel IP, NOT 0.0.0.0 and not the interface name. Binding
+# to all interfaces makes libtorrent source peer connections from eth0's real IP, which
+# NordLynx's policy routing then drops -> 0 peers, torrents stuck in "downloading_metadata".
 ses = lt.session({
-    'listen_interfaces': 'nordlynx:6881',
-    'outgoing_interfaces': 'nordlynx',
+    'listen_interfaces': f'{NORDLYNX_IP}:6881',
+    'outgoing_interfaces': NORDLYNX_IP,
     'alert_mask': lt.alert.category_t.all_categories,
     'enable_dht': True,
     'enable_lsd': True,
@@ -680,21 +700,19 @@ def _nordlynx_ifindex():
 
 
 def _rebind_to_nordlynx():
-    '''Force libtorrent to actually re-bind to the CURRENT nordlynx interface.
+    '''Force libtorrent to actually re-bind its listen socket after a NordVPN reconnect.
 
-    reopen_network_sockets() ALONE is not enough here: observed live (2026-07-23), the
-    watchdog detected an ifindex change and called it, logged success, yet the listen
-    socket stayed bound to the OLD dead ifindex for 3+ hours across multiple retries.
-    reopen_network_sockets() recreates sockets using whatever interface libtorrent already
-    has cached for the "nordlynx" name — it does not itself force a fresh lookup of that
-    name against the current OS interface table. NordVPN tears down and recreates the
-    WireGuard device on reconnect (a new ifindex, not just a new IP on the same device), so
-    the cached resolution goes stale and reopen_network_sockets() has nothing new to apply.
-    apply_settings() re-parses listen_interfaces/outgoing_interfaces from the config string,
-    which forces libtorrent to re-resolve "nordlynx" by name against the CURRENT interface
-    table before reopen_network_sockets() recreates the actual sockets against that fresh
-    resolution.'''
-    ses.apply_settings({'listen_interfaces': 'nordlynx:6881', 'outgoing_interfaces': 'nordlynx'})
+    Both previous approaches failed in production (observed live, 2026-07-23): calling
+    reopen_network_sockets() alone left the listen socket on the dead ifindex for 3+ hours,
+    and a follow-up fix that added apply_settings() first *also* left it stuck for hours
+    across dozens of retries — confirmed via `ss -tulnp` still showing the old interface
+    scope long after "successful" rebind log lines. The remaining explanation: libtorrent's
+    apply_settings() only re-applies settings whose VALUE actually changed; passing the
+    exact same string ('nordlynx:6881') it already had is a no-op, so nothing was ever
+    re-resolved. Toggling through a neutral value first forces a real change libtorrent has
+    to act on, before setting the real value back and reopening sockets against it.'''
+    ses.apply_settings({'listen_interfaces': '0.0.0.0:0', 'outgoing_interfaces': ''})
+    ses.apply_settings({'listen_interfaces': f'{NORDLYNX_IP}:6881', 'outgoing_interfaces': NORDLYNX_IP})
     ses.reopen_network_sockets(0)
 
 
@@ -750,14 +768,29 @@ def monitor_loop():
                             last_ifindex = _nordlynx_ifindex()  # resync baseline so the delta watchdog doesn't double-fire
                         except Exception as e:
                             log.error(f'[VPN] heal-on-stuck reopen failed: {e}')
-                    log.info(f'[MONITOR] Metadata stuck for {int(elapsed)}s, re-adding: {info_hash}')
-                    magnet = lt.make_magnet_uri(handle)
-                    ses.remove_torrent(handle)
-                    params = lt.parse_magnet_uri(magnet)
-                    params.save_path = DOWNLOAD_PATH
-                    new_handle = ses.add_torrent(params)
-                    t['handle'] = new_handle
-                    t['added_at'] = time.time()
+
+                    # Re-adding forces a fresh tracker/DHT announce, which can unstick a
+                    # genuinely slow swarm. But resetting added_at every time made this fire
+                    # every ~60s forever for any torrent that never finds peers — destroying
+                    # it before DHT bootstrap (which can legitimately take longer than 60s,
+                    # especially over the VPN) ever had a chance to complete. Cap it: a few
+                    # resets are worth trying, past that it's either a dead swarm or
+                    # something reopen_network_sockets can't fix, and resetting forever only
+                    # guarantees it never succeeds.
+                    retries = t.get('metadata_stuck_retries', 0)
+                    if retries < 5:
+                        log.info(f'[MONITOR] Metadata stuck for {int(elapsed)}s, re-adding (attempt {retries + 1}/5): {info_hash}')
+                        magnet = lt.make_magnet_uri(handle)
+                        ses.remove_torrent(handle)
+                        params = lt.parse_magnet_uri(magnet)
+                        params.save_path = DOWNLOAD_PATH
+                        new_handle = ses.add_torrent(params)
+                        t['handle'] = new_handle
+                        t['added_at'] = time.time()
+                        t['metadata_stuck_retries'] = retries + 1
+                    elif retries == 5:
+                        log.warning(f'[MONITOR] Metadata stuck for {info_hash} after {retries} resets — leaving it alone, letting DHT/trackers keep trying without further resets')
+                        t['metadata_stuck_retries'] = retries + 1
                     continue
 
             # Check if download is complete. Require real wanted data AND all of it done:
