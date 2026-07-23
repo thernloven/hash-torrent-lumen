@@ -757,22 +757,26 @@ def monitor_loop():
                     threading.Thread(target=_handle_season_pack, args=(info_hash, t, save_path, torrent_info, s.name), daemon=True).start()
                 elif t.get('r2_key'):
                     # Content-based season-pack detection: a torrent added as a single
-                    # episode (season_pack=false) can still BE a full pack if its name
-                    # lacked a season token — common for foreign-language releases (e.g.
-                    # "Los simuladores" with no "Season"/"S01" in the title). Detect from
-                    # what actually downloaded rather than trusting the name-derived flag:
-                    # if more than one real video file landed for an episode-context
-                    # torrent, treat it as a pack so every episode gets discovered instead
-                    # of only the single file the backend originally pointed at.
+                    # file (season_pack=false) can still BE a full pack if the backend's
+                    # classifier found no season signal at all in its name — e.g. a
+                    # release using a language marker the classifier doesn't recognize
+                    # (fixed for the ones we know about, but this is the real safety net
+                    # for ANY such miss). Detect from what actually downloaded rather than
+                    # trusting the name-derived flag: scan this torrent's own folder
+                    # regardless of whether the backend gave us a season/episode hint —
+                    # if more than one real video file is there, it's a pack. Previously
+                    # this only ran when r2_key already had a partial /s##e##/ hint, which
+                    # meant a fully-unrecognized release (zero season/episode info, like
+                    # "El.Encargado.Temporada.1" before the classifier learned "Temporada")
+                    # had nothing to trigger re-classification and silently uploaded just
+                    # the single largest file as if it were a whole movie.
                     r2_key = t.get('r2_key', '')
                     ep_match = re.search(r'/s(\d{2})e(\d{2})/', r2_key)
-                    video_files = (
-                        find_video_files(_scoped_save_path(save_path, torrent_info), int(ep_match.group(1)))
-                        if ep_match else []
-                    )
-                    if ep_match and len(video_files) > 1:
-                        log.info(f'[MONITOR] {len(video_files)} video files found for an episode-flagged '
-                                 f'torrent — treating as season pack: {info_hash}')
+                    default_season_hint = int(ep_match.group(1)) if ep_match else None
+                    video_files = find_video_files(_scoped_save_path(save_path, torrent_info), default_season_hint)
+                    if len(video_files) > 1:
+                        log.info(f'[MONITOR] {len(video_files)} video files found for a torrent classified as '
+                                 f'single-file — treating as season pack: {info_hash}')
                         t['season_pack'] = True
                         t['status'] = 'uploading_season'
                         threading.Thread(target=_handle_season_pack, args=(info_hash, t, save_path, torrent_info, s.name), daemon=True).start()
