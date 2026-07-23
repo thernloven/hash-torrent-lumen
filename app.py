@@ -679,6 +679,25 @@ def _nordlynx_ifindex():
         return None
 
 
+def _rebind_to_nordlynx():
+    '''Force libtorrent to actually re-bind to the CURRENT nordlynx interface.
+
+    reopen_network_sockets() ALONE is not enough here: observed live (2026-07-23), the
+    watchdog detected an ifindex change and called it, logged success, yet the listen
+    socket stayed bound to the OLD dead ifindex for 3+ hours across multiple retries.
+    reopen_network_sockets() recreates sockets using whatever interface libtorrent already
+    has cached for the "nordlynx" name — it does not itself force a fresh lookup of that
+    name against the current OS interface table. NordVPN tears down and recreates the
+    WireGuard device on reconnect (a new ifindex, not just a new IP on the same device), so
+    the cached resolution goes stale and reopen_network_sockets() has nothing new to apply.
+    apply_settings() re-parses listen_interfaces/outgoing_interfaces from the config string,
+    which forces libtorrent to re-resolve "nordlynx" by name against the CURRENT interface
+    table before reopen_network_sockets() recreates the actual sockets against that fresh
+    resolution.'''
+    ses.apply_settings({'listen_interfaces': 'nordlynx:6881', 'outgoing_interfaces': 'nordlynx'})
+    ses.reopen_network_sockets(0)
+
+
 def monitor_loop():
     '''Background thread: watch for completed downloads, upload to R2, idle shutdown.'''
     global last_activity
@@ -697,7 +716,7 @@ def monitor_loop():
         if cur_ifindex and cur_ifindex != last_ifindex:
             log.info(f'[VPN] nordlynx recreated (ifindex {last_ifindex}->{cur_ifindex}) — re-binding libtorrent')
             try:
-                ses.reopen_network_sockets(0)  # re-bind listen/outgoing sockets to the new tunnel
+                _rebind_to_nordlynx()
                 for t in active_torrents.values():
                     try:
                         t['handle'].force_reannounce()
@@ -726,7 +745,7 @@ def monitor_loop():
                     if time.time() - last_socket_reopen > 120:
                         log.info('[VPN] metadata stuck with no peers — forcing socket re-bind (heal-on-stuck)')
                         try:
-                            ses.reopen_network_sockets(0)
+                            _rebind_to_nordlynx()
                             last_socket_reopen = time.time()
                             last_ifindex = _nordlynx_ifindex()  # resync baseline so the delta watchdog doesn't double-fire
                         except Exception as e:
