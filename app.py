@@ -527,8 +527,6 @@ def _handle_season_pack(info_hash, t, save_path, torrent_info, torrent_name):
     staging key and get reported to the backend for the user to confirm season/episode.'''
     global last_activity
 
-    save_path = _scoped_save_path(save_path, torrent_info)
-
     # Try to extract a default season number from the torrent name
     default_season = None
     if torrent_name:
@@ -542,7 +540,29 @@ def _handle_season_pack(info_hash, t, save_path, torrent_info, torrent_name):
         if m:
             default_season = int(m.group(1))
 
-    video_files = find_video_files(save_path, default_season)
+    if torrent_info and torrent_info.num_files() > 1:
+        video_files = find_video_files(_scoped_save_path(save_path, torrent_info), default_season)
+    elif torrent_info and torrent_info.num_files() == 1:
+        # Misflagged as a season pack (e.g. a name that happens to match a season-number
+        # pattern) but structurally single-file -- there's no subfolder to scope to, and
+        # scanning the shared DOWNLOAD_PATH root would risk the exact same cross-torrent
+        # contamination the num_files() > 1 guard elsewhere exists to prevent (see the
+        # One Day / Marley and Me incident, 2026-07-23). Resolve straight from the one file
+        # libtorrent actually knows about instead of scanning anything.
+        file_path = os.path.join(save_path, torrent_info.files().file_path(0))
+        if os.path.exists(file_path):
+            fname = os.path.basename(file_path)
+            season, episode = parse_episode_info(fname, default_season)
+            video_files = [{
+                'path': file_path, 'filename': fname, 'size': os.path.getsize(file_path),
+                'season': season, 'episode': episode,
+                'suggested_season': season or default_season, 'suggested_episode': episode,
+                'extension': os.path.splitext(fname)[1].lstrip('.').lower(),
+            }]
+        else:
+            video_files = []
+    else:
+        video_files = []
 
     if not video_files:
         log.error(f'[SEASON] No video files found in season pack: {info_hash}')
